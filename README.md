@@ -360,4 +360,4 @@ Before deploying, consider adding:
 
 ## License
 
-No license is currently declared for this repository. Add a license file if you intend for others to use, modify, or redistribute the project.
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
