@@ -142,6 +142,16 @@ class TTLCache:
         self.items.clear()
         self.bytes = 0
 
+        if self.db_path:
+            conn = connect(self.db_path)
+            cursor = conn.cursor()
+
+            cursor.execute("DELETE FROM cache")
+
+            conn.commit()
+            cursor.close()
+            conn.close()
+
     def __len__(self):
         return len(self.items)
     
