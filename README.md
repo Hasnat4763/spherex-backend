@@ -1,18 +1,23 @@
 # SPHEREx Backend API
 
-A lightweight Flask backend for discovering SPHEREx observations and retrieving image products from the NASA/IPAC Infrared Science Archive (IRSA).
+A Flask backend for discovering SPHEREx observations and retrieving image products from the NASA/IPAC Infrared Science Archive (IRSA).
 
-The service provides coordinate-based observation searches, PNG previews generated from FITS cutouts, original FITS cutouts, API metadata, and explicit responses for capabilities that are not currently implemented.
+The service supports coordinate-based observation searches, FITS cutouts, PNG previews generated from FITS data, CDS SPHEREx HiPS sky-map assets, HiPS-generated sky previews, sky-tile metadata, health checks, caching, and structured JSON errors.
 
 ## Features
 
 - Query SPHEREx observations by right ascension, declination, search radius, and spectral band.
-- Query the configured SPHEREx data releases through the IRSA Simple Image Access (SIA2) service.
+- Query configured SPHEREx releases through the IRSA Simple Image Access 2 (SIA2) service.
+- Query configured releases concurrently and combine their results.
 - Normalize IRSA metadata into a consistent JSON representation.
-- Generate PNG previews from FITS image data using percentile normalization and an asinh stretch.
+- Generate PNG previews from FITS image data using percentile normalization and an inverse hyperbolic sine stretch.
 - Return original FITS cutouts from the upstream archive.
+- Proxy official CDS SPHEREx HiPS assets for all supported bands.
+- Generate HiPS PNG previews through the CDS `hips2fits` service.
+- Provide sky-tile metadata and observation results for sky-map clients.
 - Cache observation metadata and generated previews using an in-memory TTL cache backed by SQLite.
-- Expose service and cache configuration through environment variables.
+- Automatically create the SQLite database directory, database, and cache table in a new environment.
+- Support cross-origin requests for frontend clients through Flask-CORS.
 - Return structured JSON errors for invalid input, unavailable observations, upstream failures, and timeouts.
 
 ## API overview
@@ -21,12 +26,27 @@ The application runs on port `5000` by default and registers its main blueprint 
 
 ### `GET /`
 
-Returns a machine-readable service overview, including the available endpoints, defaults, configured releases, and the upstream IRSA SIA URL.
+Returns a machine-readable service overview, including the available core endpoints, configured releases, and the upstream IRSA SIA URL.
+
+```bash
+curl http://localhost:5000/
+```
+
+### `GET /health`
+### `GET /api/health`
+
+Returns a simple process health response:
+
+```json
+{
+  "status": "ok"
+}
+```
 
 Example:
 
 ```bash
-curl http://localhost:5000/
+curl http://localhost:5000/health
 ```
 
 ### `GET /api/spherex/stats`
@@ -66,7 +86,7 @@ Searches for SPHEREx observations around a sky coordinate. The backend queries e
 | `radius` | No | `0.1` | Search radius in degrees. Must be greater than `0` and no more than `5`. |
 | `band` | No | `SPHEREx-D2` | One of `SPHEREx-D1` through `SPHEREx-D6`, or `all`. |
 
-Supported bands and approximate wavelength ranges:
+Supported bands:
 
 | Band | Wavelength range |
 | --- | --- |
@@ -83,54 +103,27 @@ Example:
 curl "http://localhost:5000/api/spherex/observations?ra=180&dec=0&radius=0.1&band=SPHEREx-D2"
 ```
 
-Each returned observation may include fields such as:
-
-- `obs_id` and `product_id`
-- observation coordinates and angular `distance` from the query position
-- `coverage_at_query`
-- observation start and end dates in ISO-8601 format
-- Modified Julian Date values
-- wavelength band and wavelength limits in microns
-- spectral resolution, exposure time, detector dimensions, pixel scale, and field of view
-- target name and target type
-- quality and provenance metadata
-- generated `image_url` and `cutout_url` values for the preview and FITS endpoints
-
-The response is a JSON array. Internal upstream fields are not exposed directly.
+Returned records may include coordinates, angular distance, coverage information, observation dates, Modified Julian Dates, wavelength information, spectral resolution, release metadata, exposure details, detector dimensions, target information, quality and provenance metadata, and generated frontend URLs.
 
 ### `GET /api/spherex/image/<obs_id>`
 
-Fetches a FITS cutout from IRSA, converts it to a PNG preview, and returns the image bytes with `Content-Type: image/png`.
-
-#### Path parameter
-
-- `obs_id`: Observation identifier returned by the observations endpoint.
+Fetches a FITS cutout from IRSA, converts it to a PNG preview, and returns the image with `Content-Type: image/png`.
 
 #### Query parameters
 
 | Parameter | Required | Default | Description |
 | --- | --- | --- | --- |
 | `product` | Recommended | — | Product identifier returned by the observations endpoint. |
-| `ra` | Yes | — | Right ascension in degrees, from `0` through `360`. |
-| `dec` | Yes | — | Declination in degrees, from `-90` through `90`. |
+| `ra` | Yes | — | Right ascension in degrees. |
+| `dec` | Yes | — | Declination in degrees. |
 | `size` | No | `0.5` | Cutout size in degrees. Must be between `0.01` and `0.5`. |
 
-The server stores observation metadata in memory after a successful observation search. Therefore, query `/observations` first and then use the returned image URL or provide the matching `product` value. Metadata is not guaranteed to survive a process restart or deployment with multiple independent workers.
-
-Example:
+The observation metadata must have been loaded through `/observations` first because the product lookup is maintained in process memory.
 
 ```bash
 curl -o preview.png \
   "http://localhost:5000/api/spherex/image/OBSERVATION_ID?product=PRODUCT_ID&ra=180&dec=0&size=0.1"
 ```
-
-The preview conversion process:
-
-1. Reads the first usable 2D image HDU from the FITS file.
-2. Uses the 1st and 99.5th finite-pixel percentiles for contrast limits.
-3. Applies an inverse hyperbolic sine stretch.
-4. Converts the result to an RGB PNG with a slight blue tint.
-5. Replaces invalid pixels with black.
 
 ### `GET /api/spherex/cutout`
 
@@ -141,22 +134,98 @@ Returns the original FITS cutout from IRSA with `Content-Type: application/fits`
 | Parameter | Required | Default | Description |
 | --- | --- | --- | --- |
 | `product` | Yes | — | Product identifier returned by the observations endpoint. |
-| `ra` | Yes | — | Right ascension in degrees, from `0` through `360`. |
-| `dec` | Yes | — | Declination in degrees, from `-90` through `90`. |
+| `ra` | Yes | — | Right ascension in degrees. |
+| `dec` | Yes | — | Declination in degrees. |
 | `size` | No | `0.5` | Cutout size in degrees. Must be between `0.01` and `0.5`. |
-
-Example:
 
 ```bash
 curl -o cutout.fits \
   "http://localhost:5000/api/spherex/cutout?product=PRODUCT_ID&ra=180&dec=0&size=0.1"
 ```
 
-The response includes an inline `Content-Disposition` filename based on the observation ID and an `X-Data-Source` header identifying the IRSA cutout service.
+### `GET /api/spherex/sky/preview`
+
+Generates a PNG sky preview using the CDS SPHEREx HiPS `hips2fits` service.
+
+#### Query parameters
+
+| Parameter | Required | Default | Description |
+| --- | --- | --- | --- |
+| `band` | No | `D2` | `D1` through `D6`, or `SPHEREx-D1` through `SPHEREx-D6`. |
+| `ra` | Yes | — | Right ascension in degrees, from `0` through `360`. |
+| `dec` | Yes | — | Declination in degrees, from `-90` through `90`. |
+| `fov` | Yes | — | Field of view in degrees, from `0.01` through `0.5`. |
+| `width` | No | `512` | Output width in pixels, from `128` through `1024`. |
+| `height` | No | `512` | Output height in pixels, from `128` through `1024`. |
+
+Example:
+
+```bash
+curl -o sky-preview.png \
+  "http://localhost:5000/api/spherex/sky/preview?band=D6&ra=180&dec=0&fov=0.1&width=512&height=512"
+```
+
+The endpoint returns `image/png` and includes cache and data-source headers.
+
+### `GET /api/spherex/sky/hips/<band>/`
+### `GET /api/spherex/sky/hips/<band>/<asset>`
+
+Proxies official CDS SPHEREx HiPS assets. Supported bands are `D1` through `D6`, and the route accepts both a trailing slash and a specific asset path.
+
+Supported asset paths include:
+
+```text
+properties
+Moc.fits
+Norder<number>/Allsky.png
+Norder<number>/Allsky.jpg
+Norder<number>/Allsky.fits
+Norder<number>/Dir<number>/Npix<number>.png
+Norder<number>/Dir<number>/Npix<number>.jpg
+Norder<number>/Dir<number>/Npix<number>.fits
+```
+
+Examples:
+
+```bash
+curl http://localhost:5000/api/spherex/sky/hips/D6/properties
+curl -o Moc.fits http://localhost:5000/api/spherex/sky/hips/D6/Moc.fits
+curl -o allsky.png http://localhost:5000/api/spherex/sky/hips/D6/Norder3/Allsky.png
+```
+
+The proxy validates asset paths before requesting the upstream service and rejects path traversal attempts. Response content types are taken from the upstream response when available, with fallbacks of `text/plain` for `properties`, `application/fits` for FITS assets, and `image/png` for image assets.
+
+### `GET /api/spherex/sky/tiles/<z>/<x>/<y>`
+
+Returns metadata for an equirectangular sky tile.
+
+- `z` must be between `0` and `20`.
+- `y` must be within the valid tile range for the zoom level.
+- `x` wraps horizontally across right ascension.
+- Tiles below zoom level `6` return coordinate-overview metadata without querying IRSA.
+- Tiles at zoom level `6` and above query the relevant sky region and return matching observations.
+
+The optional `band` query parameter accepts `D1` through `D6`, `SPHEREx-D1` through `SPHEREx-D6`, or `all`.
+
+Example:
+
+```bash
+curl "http://localhost:5000/api/spherex/sky/tiles/6/32/20?band=D6"
+```
+
+## Observation response URLs
+
+Observation records expose URLs for related products when a usable product identifier is available:
+
+- `image_url` — generated PNG preview from the observation FITS cutout.
+- `cutout_url` — original FITS cutout.
+- `hips_preview_url` — CDS HiPS PNG preview for the observation position and band.
+
+## Not currently implemented
 
 ### `POST /api/spherex/detect-moving-objects`
 
-Not currently implemented. The endpoint returns HTTP `501`:
+Returns HTTP `501` because the backend does not infer object classifications or motion from image metadata.
 
 ```json
 {
@@ -167,9 +236,7 @@ Not currently implemented. The endpoint returns HTTP `501`:
 
 ### `GET /api/spherex/search`
 
-Not currently implemented. Target-name search is not provided by the current SIA metadata integration. Search by sky coordinates instead.
-
-The endpoint returns HTTP `501`:
+Returns HTTP `501` because target-name search is not provided by the current SIA metadata integration. Search by sky coordinates instead.
 
 ```json
 {
@@ -196,13 +263,16 @@ Common error codes include:
 | `400` | `INVALID_COORDINATE` | `ra` or `dec` is missing, non-numeric, or outside its valid range. |
 | `400` | `INVALID_RADIUS` | The search radius is not greater than `0` or exceeds `5` degrees. |
 | `400` | `INVALID_BAND` | The requested band is not supported. |
-| `400` | `INVALID_CUTOUT_SIZE` | The cutout size is outside `0.01–0.5` degrees or is invalid. |
+| `400` | `INVALID_CUTOUT_SIZE` | The cutout or preview field of view is outside `0.01–0.5` degrees. |
+| `400` | `INVALID_DIMENSION` | HiPS preview width or height is not an integer from `128` through `1024`. |
+| `400` | `INVALID_HIPS_ASSET` | The requested HiPS asset path is not allowed. |
+| `400` | `INVALID_TILE` | The requested sky tile coordinates are invalid. |
 | `404` | `OBSERVATION_NOT_FOUND` | The product or observation is not present in the server's metadata cache. |
 | `501` | `SEARCH_UNAVAILABLE` | Target-name search is not implemented. |
 | `501` | `MOVING_OBJECT_ANALYSIS_UNAVAILABLE` | Moving-object analysis is not implemented. |
 | `502` | `IRSA_UNAVAILABLE` | No configured IRSA release returned usable metadata. |
-| `502` | `UPSTREAM_ERROR` | The upstream service returned an unsuccessful response or another request error occurred. |
-| `504` | `UPSTREAM_TIMEOUT` | The upstream IRSA request exceeded the configured timeout. |
+| `502` | `UPSTREAM_ERROR` | An upstream service returned an unsuccessful response or another request error occurred. |
+| `504` | `UPSTREAM_TIMEOUT` | An upstream request exceeded the configured timeout. |
 
 ## Architecture
 
@@ -222,6 +292,10 @@ Flask application (main.py)
           |       |
           |       +--> NASA/IPAC IRSA archive
           |
+          +--> HiPS proxy and sky previews
+          |       |
+          |       +--> CDS SPHEREx HiPS / hips2fits
+          |
           +--> FITS-to-PNG conversion (spherex/fits.py)
           |
           +--> TTL caches (spherex/cache.py + SQLite)
@@ -229,28 +303,29 @@ Flask application (main.py)
 
 ### Main modules
 
-- `main.py` — creates the Flask application, loads environment variables, registers the blueprint, exposes `/` and `/api/spherex/stats`, and starts the development server.
-- `spherex/routes.py` — defines HTTP routes, validates request parameters, manages observation lookup, fetches previews and FITS files, and formats errors.
+- `main.py` — creates the Flask application, enables CORS, loads environment variables, registers the blueprint, exposes the service overview, stats, and health endpoints, and starts the development server.
+- `spherex/routes.py` — defines HTTP routes, validates request parameters, manages observation lookup, serves FITS and PNG products, proxies HiPS assets, generates sky previews, creates sky-tile metadata, and formats errors.
 - `spherex/irsa.py` — communicates with IRSA SIA2, parses responses, normalizes observation metadata, applies coordinate and band filtering, and creates frontend-facing URLs.
 - `spherex/fits.py` — reads FITS image data and converts it to PNG previews.
-- `spherex/cache.py` — implements an in-memory TTL/LRU-style cache with SQLite persistence for cached values.
+- `spherex/cache.py` — implements an in-memory TTL/LRU-style cache with SQLite persistence. It creates the database directory, SQLite database, and cache table automatically when needed.
 
-## Data source
+## Data sources
 
-The backend uses the NASA/IPAC Infrared Science Archive SIA2 service. The default endpoint is:
+The backend uses these external services:
 
-```text
-https://irsa.ipac.caltech.edu/SIA
-```
+- NASA/IPAC IRSA SIA2: `https://irsa.ipac.caltech.edu/SIA`
+- CDS SPHEREx HiPS assets: `https://alasky.cds.unistra.fr/SPHEREx`
+- CDS HiPS image service: `https://alasky.cds.unistra.fr/hips-image-services/hips2fits`
 
-The service performs on-demand queries rather than maintaining a local observation catalog. Results are requested from the configured releases, normalized, filtered, and cached.
+Observation queries are performed on demand rather than against a local observation catalog. Results are requested from configured IRSA releases, normalized, filtered, and cached.
 
 ## Requirements
 
-The repository is Python-based and currently does not include a `requirements.txt` or `pyproject.toml`. Install the runtime dependencies manually:
+The project includes a pinned `requirements.txt` file. Install dependencies with:
 
 ```bash
-python -m pip install Flask python-dotenv requests numpy Pillow astropy
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
 Python 3.10 or newer is recommended.
@@ -281,7 +356,7 @@ Python 3.10 or newer is recommended.
 
    ```bash
    python -m pip install --upgrade pip
-   python -m pip install Flask python-dotenv requests numpy Pillow astropy
+   python -m pip install -r requirements.txt
    ```
 
 4. Start the API:
@@ -293,10 +368,32 @@ Python 3.10 or newer is recommended.
 5. Verify that it is running:
 
    ```bash
-   curl http://localhost:5000/
+   curl http://localhost:5000/health
+   curl http://localhost:5000/api/spherex/stats
    ```
 
 The server binds to `0.0.0.0` and uses port `5000` by default.
+
+## Automatic database initialization
+
+The cache uses SQLite at:
+
+```text
+spherex/db/cache.db
+```
+
+On startup, the backend automatically:
+
+1. Creates the `spherex/db` directory if it does not exist.
+2. Creates `cache.db` if it does not exist.
+3. Creates the `cache` table if it does not exist.
+4. Commits the schema transaction.
+
+No manual database migration or initialization command is required for a new environment.
+
+The generated database is ignored by Git through the `*.db` rule.
+
+The SQLite database stores cache data only. Observation records used by `/image/<obs_id>` and `/cutout` remain in process memory. In a multi-worker deployment, each worker has its own observation map, so use sticky routing or a shared metadata store if requests can move between workers.
 
 ## Configuration
 
@@ -307,13 +404,14 @@ Configuration is read from environment variables. A `.env` file is supported thr
 | `PORT` | `5000` | Local HTTP port used by `main.py`. |
 | `FLASK_DEBUG` | `false` | Enables Flask debug mode when set to `true`. |
 | `SPHEREX_SIA_URL` | `https://irsa.ipac.caltech.edu/SIA` | Upstream IRSA SIA2 endpoint. |
+| `SPHEREX_HIPS_BASE_URL` | `https://alasky.cds.unistra.fr/SPHEREx` | Base URL for proxied CDS SPHEREx HiPS assets. |
+| `SPHEREX_HIPS2FITS_URL` | `https://alasky.cds.unistra.fr/hips-image-services/hips2fits` | CDS HiPS image-generation endpoint. |
 | `SPHEREX_RELEASES` | `spherex_qr3,spherex_qr2` | Comma-separated list of IRSA collections to query. |
 | `SPHEREX_UPSTREAM_TIMEOUT_MS` | `60000` | Timeout for upstream requests in milliseconds. |
 | `SPHEREX_QUERY_CACHE_TTL_MS` | `600000` | Observation metadata cache lifetime in milliseconds. |
 | `SPHEREX_IMAGE_CACHE_TTL_MS` | `1800000` | PNG preview cache lifetime in milliseconds. |
 | `SPHEREX_IMAGE_CACHE_MAX_BYTES` | `67108864` | Maximum in-memory preview cache size in bytes. |
-| `SPHEREX_PREVIEW_SIZE_DEGREES` | `0.5` | Default preview size in degrees. |
-| `SPHEREX_REVIEW_SIZE_DEGREES` | `0.5` | Legacy/configuration value exposed by `main.py`; route defaults use `SPHEREX_PREVIEW_SIZE_DEGREES`. |
+| `SPHEREX_PREVIEW_SIZE_DEGREES` | `0.5` | Default preview and cutout size in degrees. |
 | `NODE_ENV` | — | When set to `development`, internal error details may be included in API error responses. |
 
 Example `.env` file:
@@ -322,6 +420,8 @@ Example `.env` file:
 PORT=5000
 FLASK_DEBUG=false
 SPHEREX_SIA_URL=https://irsa.ipac.caltech.edu/SIA
+SPHEREX_HIPS_BASE_URL=https://alasky.cds.unistra.fr/SPHEREx
+SPHEREX_HIPS2FITS_URL=https://alasky.cds.unistra.fr/hips-image-services/hips2fits
 SPHEREX_RELEASES=spherex_qr3,spherex_qr2
 SPHEREX_UPSTREAM_TIMEOUT_MS=60000
 SPHEREX_QUERY_CACHE_TTL_MS=600000
@@ -335,11 +435,13 @@ NODE_ENV=production
 
 - Observation query results are cached for 10 minutes by default.
 - Generated PNG previews are cached for 30 minutes by default and are limited to 64 MiB in memory.
-- The cache implementation also creates `spherex/db/cache.db` by default. This file is ignored by Git through the `*.db` rule.
+- The SQLite cache is initialized automatically on application startup.
+- Full FITS files are fetched from IRSA and are not stored permanently in the cache.
 - Observation metadata used by `/image/<obs_id>` and `/cutout` is stored in process memory. A client should request observations before requesting a preview or FITS cutout.
 - In a multi-worker deployment, each worker has its own in-memory observation map. Use sticky behavior, a shared metadata store, or an architectural change if requests can move between workers.
-- IRSA is an external dependency. Availability, response time, rate limits, and returned metadata can affect API responses.
+- IRSA and CDS are external dependencies. Availability, response time, rate limits, and returned metadata can affect API responses.
 - Do not enable Flask debug mode in production.
+- CORS is enabled for frontend clients. Restrict the allowed origins before deploying publicly if your security model requires it.
 
 ## Development
 
@@ -351,8 +453,7 @@ FLASK_DEBUG=true python main.py
 
 Before deploying, consider adding:
 
-- a pinned dependency file such as `requirements.txt` or `pyproject.toml`
-- automated tests for validation, IRSA parsing, cache behavior, and FITS conversion
+- automated tests for validation, IRSA parsing, HiPS paths, cache behavior, and FITS conversion
 - production WSGI serving, for example Gunicorn or another supported server
 - structured logging and request metrics
 - a shared store for observation metadata when running multiple workers
