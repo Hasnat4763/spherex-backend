@@ -148,16 +148,19 @@ class TTLCache:
     def db_init(self):
         conn = connect(self.db_path)
         cursor = conn.cursor()
+
         cursor.execute(
             """
-            CREATE  TABLE IF NOT EXISTS cache (
-            key TEXT PRIMARY KEY,
-            value BLOB,
-            expires_at REAL,
-            bytes INTEGER
+            CREATE TABLE IF NOT EXISTS cache (
+                key TEXT PRIMARY KEY,
+                value BLOB NOT NULL,
+                expires_at REAL NOT NULL,
+                bytes INTEGER NOT NULL DEFAULT 0
             )
-                    """
+            """
         )
+
+        conn.commit()
         cursor.close()
         conn.close()
 

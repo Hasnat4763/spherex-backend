@@ -572,7 +572,7 @@ def hips_asset(band, asset=None):
 
         result = Response(
             resp.content,
-            mimetype=content_type,
+            content_type=content_type,
         )
 
         result.headers["Cache-Control"] = "public, max-age=1800"
