@@ -440,7 +440,7 @@ def image(obs_id):
 @spherex_bp.get("/sky/preview")
 def sky_preview():
     try:
-        band = requests.args.get("band", "D2").upper()
+        band = request.args.get("band", "D2").upper()
 
         if band not in ["D1", "D2", "D3", "D4", "D5", "D6"]:
             raise APIError(
