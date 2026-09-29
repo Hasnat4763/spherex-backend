@@ -114,6 +114,12 @@ def stats():
         "unique_targets": None
     })
 
+@app.get("/health")
+@app.get("/api/health")
+def health():
+    return jsonify({
+    "status": "ok"
+    })
 
 
 if __name__ == "__main__":

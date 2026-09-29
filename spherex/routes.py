@@ -4,18 +4,24 @@ from urllib.parse import urlencode, urlparse, urlunparse
 import requests
 from flask import Blueprint, Response, jsonify, request
 
+import re
+from urllib.parse import quote
+
+import math
+
 from .cache import TTLCache
 from .fits import fits_to_png
 from .irsa import (
+    HIPS_BASE_URL,
     APIError,
     BAND_RANGES_MICRONS,
-    DEFAULT_RELEASES,
     IMAGE_CACHE_MAX_BYTES,
     PREVIEW_SIZE_DEGREES,
     UPSTREAM_TIMEOUT_MS,
     get_observations,
     parse_coordinate,
     parse_radius,
+    HIPS2FITS_URL,
 )
 
 
@@ -427,6 +433,193 @@ def image(obs_id):
             "message": str(error),
         }), 502
 
+#-----------------------------------------------------------------------------
+# Accessing HiPs server to display a sky preview
+#-----------------------------------------------------------------------------
+
+@spherex_bp.get("/sky/preview")
+def sky_preview():
+    try:
+        band = requests.args.get("band", "D2").upper()
+
+        if band not in ["D1", "D2", "D3", "D4", "D5", "D6"]:
+            raise APIError(
+                400,
+                "INVALID_BAND",
+                "band must be one of D1 through D6."
+            )
+
+        ra = parse_coordinate(
+            request.args.get("ra"),
+            "ra",
+            0,
+            360,
+        )
+
+        dec = parse_coordinate(
+                    request.args.get("dec"),
+                    "dec",
+                    -90,
+                    90,
+        )
+
+        fov = validate_cutout_size(
+            request.args.get("fov")
+        )
+
+        width = min(
+            1024,
+            max(128, int(request.args.get("width", 512)))
+        )
+        height = min(
+                    1024,
+                    max(128, int(request.args.get("height", 512)))
+        )
+
+        params = {
+            "hips": f"CDS/P/SPHEREx/QR2/{band}",
+            "ra": ra,
+            "dec": dec,
+            "fov": fov,
+            "width": width,
+            "height": height,
+            "projection": "SIN",
+            "format": "png",
+        }
+
+        resp = requests.get(
+            HIPS2FITS_URL,
+            params=params,
+            timeout=UPSTREAM_TIMEOUT_MS / 1000,
+        )
+
+        resp.raise_for_status()
+
+        result = Response(
+            resp.content,
+            mimetype="image/png",
+        )
+
+        result.headers["Cache-Control"] = "public, max-age=1800"
+        result.headers["Access-Control-Allow-Origin"] = "*"
+        result.headers["X-Data-Source"] = "CDS SPHEREx HiPs service"
+
+        return result
+
+    except APIError as e:
+        return error_response(e)
+
+    except requests.Timeout:
+        return jsonify({
+            "error": "UPSTREAM_TIMEOUT",
+            "message": (
+                "The HiPs image service timed out."
+            ),
+        }), 504
+
+    except requests.RequestException as e:
+        return jsonify({
+            "error": "UPSTREAM_ERROR",
+            "message": str(e),
+        }), 502
+
+@spherex_bp.get("/sky/hips/<band>/<path:asset>")
+@spherex_bp.get("/sky/hips/<band>/")
+def hips_asset(band, asset=None):
+    try:
+        band = band.upper()
+        if band.startswith("SPHEREX-"):
+            band = band.replace("SPHEREX-", "")
+        if band not in ["D1", "D2", "D3", "D4", "D5", "D6"]:
+            raise APIError(
+                400,
+                "INVALID_BAND",
+                "band must be one of D1 through D6."
+            )
+        if asset in {"", None}:
+            asset = "properties"
+
+        valid_asset = re.fullmatch(
+            r"(properties|Norder\d+/Dir\d+/Npix\d+\.(png|jpg|fits))",
+            asset
+        )
+
+        if not valid_asset:
+            raise APIError(
+                400,
+                "INVALID__HIPS_ASSET",
+                "asset must be a valid HiPS asset path."
+            )
+
+        upstream_url = (
+            f"{HIPS_BASE_URL}/{band}/{quote(asset, safe='/')}"
+        )
+
+        resp = requests.get(
+            upstream_url,
+            timeout=UPSTREAM_TIMEOUT_MS / 1000,
+        )
+
+        resp.raise_for_status()
+
+        content_type = resp.headers.get(
+            "Content-Type",
+            "text/plain" if asset == "properties" else "image/png"
+        )
+
+        result = Response(
+            resp.content,
+            mimetype=content_type,
+        )
+
+        result.headers["Cache-Control"] = "public, max-age=1800"
+        result.headers["Access-Control-Allow-Origin"] = "*"
+        result.headers["X-Data-Source"] = "CDS SPHEREx HiPS"
+
+        return result
+
+    except APIError as e:
+        return error_response(e)
+
+    except requests.Timeout:
+        return jsonify({
+            "error": "UPSTREAM_TIMEOUT",
+            "message": "The HiPS service timed out.",
+        }), 504
+
+    except requests.RequestException as e:
+        return jsonify({
+            "error": "UPSTREAM_ERROR",
+            "message": str(e),
+        }), 502
+
+@spherex_bp.get("/sky/tiles/<int:z>/<int:x>/<int:y>")
+def sky_tile(z, x, y):
+    try:
+        band = request.args.get("band", "SPHEREx-D2")
+
+        if band != "all" and band not in BAND_RANGES_MICRONS:
+            raise APIError(
+                400,
+                "INVALID_BAND",
+                "band must be one of SPHEREx-D1 through "
+                "SPHEREx-D6, or all."
+            )
+
+        return jsonify(
+            sky_tile_metadata(z, x, y, band)
+        )
+
+    except APIError as error:
+        return error_response(error)
+
+    except requests.RequestException as error:
+        return jsonify({
+            "error": "UPSTREAM_ERROR",
+            "message": str(error),
+        }), 502
+
+
 
 # ---------------------------------------------------------------------------
 # GET /cutout
@@ -549,3 +742,91 @@ def search():
             "metadata service. Search by sky coordinates instead."
         ),
     }), 501
+
+
+
+
+def sky_tile_metadata(z, x, y, band):
+    if z < 0 or z > 20:
+        raise APIError(
+            400,
+            "INVALID_TILE",
+            "z must be between 0 and 20."
+        )
+
+    dimension = 2 ** z
+
+    if y < 0 or y >= dimension:
+        raise APIError(
+            400,
+            "INVALID_TILE",
+            "y is outside the tile range."
+        )
+
+    # Wrap RA horizontally.
+    x = x % dimension
+
+    ra_min = x / dimension * 360
+    ra_max = (x + 1) / dimension * 360
+
+    dec_max = 90 - y / dimension * 180
+    dec_min = 90 - (y + 1) / dimension * 180
+
+    center_ra = (ra_min + ra_max) / 2
+    center_dec = (dec_min + dec_max) / 2
+
+    result = {
+        "tile": {
+            "z": z,
+            "x": x,
+            "y": y,
+            "bounds": {
+                "raMin": ra_min,
+                "raMax": ra_max,
+                "decMin": dec_min,
+                "decMax": dec_max,
+            },
+            "resolution": (
+                "SPHEREx-cutout"
+                if z >= 6
+                else "coordinate-overview"
+            ),
+        }
+    }
+
+    # Avoid querying IRSA for every low-resolution map tile.
+    if z < 6:
+        result["observations"] = []
+        return result
+
+    tile_radius = min(
+        5,
+        max(
+            0.1,
+            math.hypot(
+                (ra_max - ra_min) / 2,
+                (dec_max - dec_min) / 2,
+            ),
+        ),
+    )
+
+    selected_band = None if band == "all" else band
+
+    records = get_observations(
+        ra=center_ra,
+        dec=center_dec,
+        radius=tile_radius,
+        band=selected_band,
+    )
+
+    result["observations"] = [
+        {
+            key: value
+            for key, value in record.items()
+            if not key.startswith("_")
+        }
+        for record in records
+    ]
+
+    return result
+    

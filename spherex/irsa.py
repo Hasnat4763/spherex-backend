@@ -18,6 +18,17 @@ IRSA_SIA_URL = os.getenv(
     "SPHEREX_SIA_URL",
     "https://irsa.ipac.caltech.edu/SIA"
 )
+HIPS_BASE_URL = os.getenv(
+    "SPHEREX_HIPS_BASE_URL",
+    "https://alasky.cds.unistra.fr/SPHEREx"
+)
+
+HIPS2FITS_URL = os.getenv(
+    "SPHEREX_HIPS2FITS_URL",
+    "https://alasky.cds.unistra.fr/hips-image-services/hips2fits"
+)
+
+
 
 DEFAULT_RELEASES = [
     value.strip()
@@ -510,6 +521,22 @@ def normalize_record(row, ra, dec, requested_release):
 
         record["cutout_url"] = (
             f"/api/spherex/cutout?{params}"
+        )
+
+        hips_band = (
+            row.get("energy_bandpassname") or "SPHEREx-D2"
+        ).replace("SPHEREx-", "")
+
+        record["hips_preview_url"] = (
+            "/api/spherex/sky/preview?"
+            + urlencode({
+                "band": hips_band,
+                "ra": str(ra),
+                "dec": str(dec),
+                "fov": str(PREVIEW_SIZE_DEGREES),
+                "width": "512",
+                "height": "512",
+            })
         )
 
     return record
