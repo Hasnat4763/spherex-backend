@@ -147,6 +147,83 @@ def validate_cutout_size(value):
     return size
 
 
+VALID_SKY_BANDS = {"D1", "D2", "D3", "D4", "D5", "D6"}
+VALID_HIPS_ASSET = re.compile(
+    r"^(?:properties|Moc\.fits|Norder\d+/Allsky\.(?:png|jpg|fits)|"
+    r"Norder\d+/Dir\d+/Npix\d+\.(?:png|jpg|fits))$"
+)
+
+
+def normalize_hips_band(value):
+    band = (value or "D2").strip().upper()
+
+    if band.startswith("SPHEREX-"):
+        band = band.replace("SPHEREX-", "")
+
+    if band not in VALID_SKY_BANDS:
+        raise APIError(
+            400,
+            "INVALID_BAND",
+            "band must be one of D1 through D6."
+        )
+
+    return band
+
+
+def normalize_spherex_band(value, allow_all=False):
+    if value is None:
+        raw = "SPHEREx-D2"
+    else:
+        raw = value.strip()
+
+    upper = raw.upper()
+
+    if allow_all and upper == "ALL":
+        return "all"
+
+    if upper.startswith("SPHEREX-"):
+        upper = upper.replace("SPHEREX-", "")
+
+    if upper not in VALID_SKY_BANDS:
+        raise APIError(
+            400,
+            "INVALID_BAND",
+            "band must be one of SPHEREx-D1 through SPHEREx-D6, or all."
+        )
+
+    return f"SPHEREx-{upper}"
+
+
+def parse_preview_dimension(value, name):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise APIError(
+            400,
+            "INVALID_DIMENSION",
+            f"{name} must be an integer between 128 and 1024."
+        )
+
+    if number < 128 or number > 1024:
+        raise APIError(
+            400,
+            "INVALID_DIMENSION",
+            f"{name} must be an integer between 128 and 1024."
+        )
+
+    return number
+
+
+def fallback_hips_content_type(asset):
+    if asset == "properties":
+        return "text/plain"
+
+    if asset.endswith(".fits"):
+        return "application/fits"
+
+    return "image/png"
+
+
 # ---------------------------------------------------------------------------
 # Preview fetching
 # ---------------------------------------------------------------------------
@@ -440,17 +517,7 @@ def image(obs_id):
 @spherex_bp.get("/sky/preview")
 def sky_preview():
     try:
-        band = request.args.get("band", "D2").upper()
-
-        if band.startswith("SPHEREX-"):
-            band = band.replace("SPHEREX-", "")
-
-        if band not in ["D1", "D2", "D3", "D4", "D5", "D6"]:
-            raise APIError(
-                400,
-                "INVALID_BAND",
-                "band must be one of D1 through D6."
-            )
+        band = normalize_hips_band(request.args.get("band", "D2"))
 
         ra = parse_coordinate(
             request.args.get("ra"),
@@ -470,13 +537,13 @@ def sky_preview():
             request.args.get("fov")
         )
 
-        width = min(
-            1024,
-            max(128, int(request.args.get("width", 512)))
+        width = parse_preview_dimension(
+            request.args.get("width", "512"),
+            "width",
         )
-        height = min(
-                    1024,
-                    max(128, int(request.args.get("height", 512)))
+        height = parse_preview_dimension(
+            request.args.get("height", "512"),
+            "height",
         )
 
         params = {
@@ -530,32 +597,27 @@ def sky_preview():
 @spherex_bp.get("/sky/hips/<band>/")
 def hips_asset(band, asset=None):
     try:
-        band = band.upper()
-        if band.startswith("SPHEREX-"):
-            band = band.replace("SPHEREX-", "")
-        if band not in ["D1", "D2", "D3", "D4", "D5", "D6"]:
-            raise APIError(
-                400,
-                "INVALID_BAND",
-                "band must be one of D1 through D6."
-            )
+        band = normalize_hips_band(band)
+
         if asset in {"", None}:
             asset = "properties"
 
-        valid_asset = re.fullmatch(
-            r"(properties|Norder\d+/Dir\d+/Npix\d+\.(png|jpg|fits))",
-            asset
-        )
-
-        if not valid_asset:
+        if any(part in {".", ".."} for part in asset.split("/")):
             raise APIError(
                 400,
-                "INVALID__HIPS_ASSET",
+                "INVALID_HIPS_ASSET",
+                "asset must be a valid HiPS asset path."
+            )
+
+        if not VALID_HIPS_ASSET.fullmatch(asset):
+            raise APIError(
+                400,
+                "INVALID_HIPS_ASSET",
                 "asset must be a valid HiPS asset path."
             )
 
         upstream_url = (
-            f"{HIPS_BASE_URL}/{band}/{quote(asset, safe='/')}"
+            f"{HIPS_BASE_URL}/{band}/{quote(asset, safe='/.')}"
         )
 
         resp = requests.get(
@@ -565,9 +627,9 @@ def hips_asset(band, asset=None):
 
         resp.raise_for_status()
 
-        content_type = resp.headers.get(
-            "Content-Type",
-            "text/plain" if asset == "properties" else "image/png"
+        content_type = (
+            resp.headers.get("Content-Type")
+            or fallback_hips_content_type(asset)
         )
 
         result = Response(
@@ -599,15 +661,10 @@ def hips_asset(band, asset=None):
 @spherex_bp.get("/sky/tiles/<int:z>/<int:x>/<int:y>")
 def sky_tile(z, x, y):
     try:
-        band = request.args.get("band", "SPHEREx-D2")
-
-        if band != "all" and band not in BAND_RANGES_MICRONS:
-            raise APIError(
-                400,
-                "INVALID_BAND",
-                "band must be one of SPHEREx-D1 through "
-                "SPHEREx-D6, or all."
-            )
+        band = normalize_spherex_band(
+            request.args.get("band"),
+            allow_all=True,
+        )
 
         return jsonify(
             sky_tile_metadata(z, x, y, band)
