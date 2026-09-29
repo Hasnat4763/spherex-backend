@@ -11,15 +11,19 @@ class TTLCache:
         self.bytes = 0
 
         if db_path is None:
-            db_path = os.path.join(
-                os.path.dirname(__file__),
-                "db",
-                "cache.db",
-            )
+             db_path = os.path.join(
+                 os.path.dirname(__file__),
+                 "db",
+                 "cache.db",
+             )
 
         self.db_path = db_path
 
         if self.db_path:
+            db_directory = os.path.dirname(
+                os.path.abspath(self.db_path),
+            )
+            os.makedirs(db_directory, exist_ok=True)
             self.db_init()
 
     def get(self, key):

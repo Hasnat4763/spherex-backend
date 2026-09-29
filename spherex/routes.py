@@ -442,6 +442,9 @@ def sky_preview():
     try:
         band = request.args.get("band", "D2").upper()
 
+        if band.startswith("SPHEREX-"):
+            band = band.replace("SPHEREX-", "")
+
         if band not in ["D1", "D2", "D3", "D4", "D5", "D6"]:
             raise APIError(
                 400,

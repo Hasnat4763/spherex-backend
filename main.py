@@ -2,9 +2,11 @@ import os
 
 from flask import Flask, jsonify
 from dotenv import load_dotenv
+from flask_cors import CORS
 from spherex.routes import spherex_bp
 
 app = Flask(__name__)
+CORS(app)
 load_dotenv()
 
 app.register_blueprint(spherex_bp)
